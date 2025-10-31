@@ -1,5 +1,6 @@
+# Resolve any internal aliases for rewritten IPv6 literal addresses.
 user = mailuser
-password = cursoemail
+password = mailuser_strong_password
 hosts = 127.0.0.1
 dbname = mailserver
-query = SELECT destination FROM virtual_aliases WHERE source='%s'
+query = SELECT destination FROM virtual_aliases WHERE source = '%s'

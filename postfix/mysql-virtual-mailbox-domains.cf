@@ -1,5 +1,6 @@
+# Lookup virtual domains from MariaDB for IPv6 literal rewrite handling.
 user = mailuser
-password = cursoemail
+password = mailuser_strong_password
 hosts = 127.0.0.1
 dbname = mailserver
-query = SELECT 1 FROM virtual_domains WHERE name='%s'
+query = SELECT 1 FROM virtual_domains WHERE name = '%s'

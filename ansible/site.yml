@@ -1,0 +1,268 @@
+---
+- hosts: mailservers
+  become: true
+  collections:
+    - community.mysql
+  vars:
+    mail_hostname: mail-gw.af49.local
+    mail_origin: mail-gw.af49.local
+    mail_domain: internal.invalid
+    ipv6_network: af49::/16
+    maildb_name: mailserver
+    maildb_user: mailuser
+    maildb_password: "mailuser_strong_password"
+    virtual_uid: 5000
+    virtual_gid: 5000
+    dovecot_auth_socket: /var/spool/postfix/private/auth
+    dovecot_lmtp_socket: /var/spool/postfix/private/dovecot-lmtp
+    repo_root: "{{ playbook_dir }}/.."
+
+  handlers:
+    - name: reload postfix
+      ansible.builtin.service:
+        name: postfix
+        state: reloaded
+
+    - name: reload dovecot
+      ansible.builtin.service:
+        name: dovecot
+        state: reloaded
+
+  tasks:
+    - name: Install mail service packages
+      ansible.builtin.apt:
+        name:
+          - postfix
+          - postfix-pcre
+          - dovecot-core
+          - dovecot-imapd
+          - dovecot-lmtpd
+          - mariadb-server
+          - python3-pymysql
+          - swaks
+        state: present
+        update_cache: true
+      tags: [install]
+
+    - name: Ensure services are enabled
+      ansible.builtin.service:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop:
+        - mariadb
+        - postfix
+        - dovecot
+      tags: [install, configure, postfix, dovecot, db]
+
+    - name: Create vmail group
+      ansible.builtin.group:
+        name: vmail
+        gid: "{{ virtual_gid }}"
+        state: present
+      tags: [configure, postfix, dovecot]
+
+    - name: Create vmail user
+      ansible.builtin.user:
+        name: vmail
+        uid: "{{ virtual_uid }}"
+        group: vmail
+        home: /var/mail/vhosts
+        shell: /usr/sbin/nologin
+        system: true
+        state: present
+      tags: [configure, postfix, dovecot]
+
+    - name: Ensure mail storage root exists
+      ansible.builtin.file:
+        path: /var/mail/vhosts/{{ mail_domain }}
+        state: directory
+        owner: vmail
+        group: vmail
+        mode: "0750"
+      tags: [configure, postfix, dovecot]
+
+    - name: Deploy Postfix main.cf
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/postfix/main.cf"
+        dest: /etc/postfix/main.cf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: reload postfix
+      tags: [configure, postfix]
+
+    - name: Deploy Postfix master.cf
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/postfix/master.cf"
+        dest: /etc/postfix/master.cf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: reload postfix
+      tags: [configure, postfix]
+
+    - name: Deploy Postfix MySQL lookup files
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/postfix/{{ item }}"
+        dest: "/etc/postfix/{{ item }}"
+        owner: root
+        group: root
+        mode: "0640"
+      loop:
+        - mysql-virtual-mailbox-domains.cf
+        - mysql-virtual-mailbox-maps.cf
+        - mysql-virtual-alias-maps.cf
+      notify: reload postfix
+      tags: [configure, postfix]
+
+    - name: Deploy IPv6 literal rewrite map
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/postfix/virtual_ip_literals"
+        dest: /etc/postfix/virtual_ip_literals
+        owner: root
+        group: root
+        mode: "0644"
+      notify: reload postfix
+      tags: [configure, postfix]
+
+    - name: Ensure postfix has access to dovecot auth socket directory
+      ansible.builtin.file:
+        path: /var/spool/postfix/private
+        state: directory
+        owner: postfix
+        group: postfix
+        mode: "0755"
+      tags: [configure, postfix, dovecot]
+
+    - name: Deploy Dovecot base configuration
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/dovecot/dovecot.conf"
+        dest: /etc/dovecot/dovecot.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: reload dovecot
+      tags: [configure, dovecot]
+
+    - name: Deploy Dovecot authentication configuration
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/dovecot/conf.d/10-auth.conf"
+        dest: /etc/dovecot/conf.d/10-auth.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: reload dovecot
+      tags: [configure, dovecot]
+
+    - name: Deploy Dovecot SQL configuration
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/dovecot/dovecot-sql.conf.ext"
+        dest: /etc/dovecot/dovecot-sql.conf.ext
+        owner: root
+        group: dovecot
+        mode: "0640"
+      notify: reload dovecot
+      tags: [configure, dovecot]
+
+    - name: Ensure dovecot services have correct ownership
+      ansible.builtin.file:
+        path: /var/run/dovecot
+        state: directory
+        owner: dovecot
+        group: dovecot
+        mode: "0755"
+      tags: [configure, dovecot]
+
+    - name: Ensure MariaDB database exists
+      community.mysql.mysql_db:
+        name: "{{ maildb_name }}"
+        state: present
+      tags: [db]
+
+    - name: Ensure MariaDB mail user exists
+      community.mysql.mysql_user:
+        name: "{{ maildb_user }}"
+        host: localhost
+        password: "{{ maildb_password }}"
+        priv: "{{ maildb_name }}.*:ALL"
+        state: present
+      tags: [db]
+
+    - name: Ensure virtual_domains table exists
+      community.mysql.mysql_query:
+        login_db: "{{ maildb_name }}"
+        query:
+          - |
+            CREATE TABLE IF NOT EXISTS virtual_domains (
+              id INT AUTO_INCREMENT PRIMARY KEY,
+              name VARCHAR(255) NOT NULL UNIQUE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      tags: [db]
+
+    - name: Ensure virtual_users table exists
+      community.mysql.mysql_query:
+        login_db: "{{ maildb_name }}"
+        query:
+          - |
+            CREATE TABLE IF NOT EXISTS virtual_users (
+              id INT AUTO_INCREMENT PRIMARY KEY,
+              domain_id INT NOT NULL,
+              email VARCHAR(255) NOT NULL UNIQUE,
+              password VARCHAR(255) NOT NULL,
+              FOREIGN KEY (domain_id) REFERENCES virtual_domains(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      tags: [db]
+
+    - name: Ensure virtual_aliases table exists
+      community.mysql.mysql_query:
+        login_db: "{{ maildb_name }}"
+        query:
+          - |
+            CREATE TABLE IF NOT EXISTS virtual_aliases (
+              id INT AUTO_INCREMENT PRIMARY KEY,
+              domain_id INT NOT NULL,
+              source VARCHAR(255) NOT NULL,
+              destination VARCHAR(255) NOT NULL,
+              UNIQUE KEY unique_alias (domain_id, source),
+              FOREIGN KEY (domain_id) REFERENCES virtual_domains(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      tags: [db]
+
+    - name: Insert internal.invalid domain
+      community.mysql.mysql_query:
+        login_db: "{{ maildb_name }}"
+        query:
+          - "INSERT IGNORE INTO virtual_domains (name) VALUES ('{{ mail_domain }}');"
+      tags: [db]
+
+    - name: Insert alice test user
+      community.mysql.mysql_query:
+        login_db: "{{ maildb_name }}"
+        query:
+          - |
+            INSERT INTO virtual_users (domain_id, email, password)
+            SELECT id, 'alice+IPv6-af49--10@{{ mail_domain }}', '$6$18/uO23BxoAif3pT$hnAFXLAYlG.Kwv/tPglWOH91qy/Nap3U1FRhi2AR7sSvsmAJo6k7IxPQUerxPvZCZ1.CGkxaRBZDnr81Hf3gq0'
+            FROM virtual_domains
+            WHERE name='{{ mail_domain }}'
+            ON DUPLICATE KEY UPDATE password=VALUES(password);
+      tags: [db]
+
+    - name: Insert alice IPv6 literal alias for documentation
+      community.mysql.mysql_query:
+        login_db: "{{ maildb_name }}"
+        query:
+          - |
+            INSERT IGNORE INTO virtual_aliases (domain_id, source, destination)
+            SELECT id,
+                   'alice+IPv6-af49--10@{{ mail_domain }}',
+                   'alice+IPv6-af49--10@{{ mail_domain }}'
+            FROM virtual_domains
+            WHERE name='{{ mail_domain }}';
+      tags: [db]
+
+    - name: Cleanup mail storage (optional)
+      ansible.builtin.file:
+        path: /var/mail/vhosts
+        state: absent
+      tags: [cleanup]
